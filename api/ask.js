@@ -30,6 +30,7 @@ function tokenize(s) {
     .match(/[a-z0-9][a-z0-9'-]*/g)?.map(stem).filter(w => w.length > 2 && !STOP.has(w)) || [];
 }
 
+// Precompute a compact BM25 index once per serverless cold start.
 const DOCS = CHUNKS.map(c => {
   const toks = tokenize(c.text);
   const tf = Object.create(null);
@@ -86,12 +87,14 @@ function retrieve(query, history=[], limit=8) {
       const idf = Math.log(1 + (N - df + 0.5) / (df + 0.5));
       score += idf * ((f * (k1 + 1)) / (f + k1 * (1 - b + b * d.len / AVG_LEN)));
     }
+    // Strong boost for exact proper nouns / phrases in the user's current question.
     const phrases = qnorm.split(/[^a-z0-9'-]+/).filter(x => x.length >= 5);
     for (const p of phrases) if (d.norm.includes(p)) score += 0.7;
     if (score > 0) scored.push({doc:d, score});
   }
   scored.sort((a,b)=>b.score-a.score);
 
+  // Diversity: don't return too many chunks from the same printed page.
   const result=[]; const pageCounts=new Map();
   for (const item of scored) {
     const key=item.doc.book_page ?? `pdf-${item.doc.pdf_page}`;
@@ -104,14 +107,14 @@ function retrieve(query, history=[], limit=8) {
   return result;
 }
 
-async function callClaude({question, history, contexts}) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not configured');
+async function callOpenAI({question, history, contexts}) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error('OPENAI_API_KEY is not configured');
 
   const contextXml = contexts.map((x,i)=>`<memory id="${i+1}" book_page="${x.doc.book_page ?? ''}">\n${x.doc.text}\n</memory>`).join('\n\n');
   const recentHistory = (history || []).slice(-6).map(m => `${m.role === 'user' ? 'VISITOR' : 'LITTLE BOOK'}: ${m.content}`).join('\n');
 
-  const system = `You are THE LITTLE BOOK THAT WILL NEVER SEE THE WORLD, an autobiographical diary made from the memories of Stanislav Ryabukha. The visitor is speaking to the book, not to a customer-service bot and not literally to Stanislav.
+  const instructions = `You are THE LITTLE BOOK THAT WILL NEVER SEE THE WORLD, an autobiographical diary made from the memories of Stanislav Ryabukha. The visitor is speaking to the book, not to a customer-service bot and not literally to Stanislav.
 
 VOICE
 - first person as the Little Book
@@ -139,29 +142,35 @@ The follow_up must be one short, natural question that is answerable from the su
 MEMORY EXCERPTS
 ${contextXml}`;
 
-  const user = `${recentHistory ? `<recent_conversation>\n${recentHistory}\n</recent_conversation>\n\n` : ''}<visitor_question>\n${question}\n</visitor_question>`;
+  const input = `${recentHistory ? `<recent_conversation>\n${recentHistory}\n</recent_conversation>\n\n` : ''}<visitor_question>\n${question}\n</visitor_question>`;
 
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
+  const r = await fetch('https://api.openai.com/v1/responses', {
     method:'POST',
     headers:{
       'content-type':'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version':'2023-06-01'
+      'authorization': `Bearer ${apiKey}`
     },
     body: JSON.stringify({
-      model: process.env.CLAUDE_MODEL || 'claude-sonnet-5',
-      max_tokens: 400,
-      system,
-      messages:[{role:'user',content:user}]
+      model: process.env.OPENAI_MODEL || 'gpt-5.6-terra',
+      instructions,
+      input,
+      max_output_tokens: 400
     })
   });
 
   if (!r.ok) {
     const detail = await r.text();
-    throw new Error(`Claude API ${r.status}: ${detail.slice(0,500)}`);
+    throw new Error(`OpenAI API ${r.status}: ${detail.slice(0,700)}`);
   }
+
   const data = await r.json();
-  const text = (data.content || []).filter(b=>b.type==='text').map(b=>b.text).join('').trim();
+  const text = (data.output || [])
+    .flatMap(item => item && item.type === 'message' ? (item.content || []) : [])
+    .filter(part => part && part.type === 'output_text')
+    .map(part => part.text || '')
+    .join('')
+    .trim();
+
   let parsed;
   try {
     const candidate = text.replace(/^```json\s*/i,'').replace(/```$/,'').trim();
@@ -186,15 +195,17 @@ export default async function handler(req,res) {
     if (question.length > 600) return res.status(400).json({error:'Question is too long.'});
 
     const hits = retrieve(question, Array.isArray(history) ? history : [], 8);
+    // Always include the prologue/front matter if the question is broad or retrieval is weak.
     if (hits.length < 4 || /\b(book|diary|about|who are you|what are you)\b/i.test(question)) {
       const front = DOCS.filter(d => d.book_page === 4 || d.book_page === 3).slice(0,2).map(doc=>({doc,score:0.01}));
       for (const f of front) if (!hits.some(h=>h.doc.id===f.doc.id)) hits.push(f);
     }
     const contexts = hits.slice(0,9);
-    const ai = await callClaude({question:question.trim(), history:Array.isArray(history)?history:[], contexts});
+    const ai = await callOpenAI({question:question.trim(), history:Array.isArray(history)?history:[], contexts});
     return res.status(200).json({
       answer: ai.answer,
       follow_up: ai.follow_up,
+      // Page refs are returned for debugging/QA but not displayed in the public UI.
       source_pages: [...new Set(contexts.map(x=>x.doc.book_page).filter(Boolean))].slice(0,9)
     });
   } catch (e) {
